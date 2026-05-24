@@ -259,6 +259,21 @@ Instruction:
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+@app.get("/repos")
+async def list_repositories(db: AsyncSession = Depends(get_db)):
+    """List all ingested repositories."""
+    stmt = select(Repository).order_by(Repository.created_at.desc())
+    res = await db.execute(stmt)
+    repos = res.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "owner": r.owner,
+            "name": r.name,
+            "default_branch": r.default_branch
+        } for r in repos
+    ]
+
 @app.get("/repo/{repo_id}/summary")
 async def get_repository_summary(repo_id: int, db: AsyncSession = Depends(get_db)):
     """Fetch the parsed architecture JSON report of the repository."""
@@ -280,6 +295,18 @@ async def get_repository_summary(repo_id: int, db: AsyncSession = Depends(get_db
         "branch": repo.default_branch,
         "summary": summary_data
     }
+
+@app.delete("/repo/{repo_id}")
+async def delete_repository(repo_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete repository and all its cascading files, chunks, and graph edges."""
+    stmt = select(Repository).where(Repository.id == repo_id)
+    res = await db.execute(stmt)
+    repo = res.scalars().first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found.")
+    await db.delete(repo)
+    await db.commit()
+    return {"success": True, "message": "Repository and all cascading assets successfully deleted."}
 
 @app.get("/repo/{repo_id}/graph")
 async def get_repository_graph(repo_id: int, db: AsyncSession = Depends(get_db)):
