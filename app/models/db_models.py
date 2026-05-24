@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
 from app.database.session import Base
 
 class Repository(Base):
@@ -23,13 +24,13 @@ class File(Base):
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
     path = Column(String, nullable=False)
     content = Column(Text, nullable=False)
-    priority = Column(String, default="High")
+    priority = Column(String, default="High")  # High, Low, Ignore
     language = Column(String, nullable=True)
     hash = Column(String, nullable=True)
 
     repository = relationship("Repository", back_populates="files")
     chunks = relationship("Chunk", back_populates="file", cascade="all, delete-orphan")
-    
+
 class Chunk(Base):
     __tablename__ = "chunks"
 
@@ -38,11 +39,13 @@ class Chunk(Base):
     file_path = Column(String, nullable=False)
     symbol_name = Column(String, nullable=True)
     language = Column(String, nullable=True)
-    imports = Column(JSON, default=list)
-    dependencies = Column(JSON, default=list)
+    imports = Column(JSON, default=list)  # list of imports
+    dependencies = Column(JSON, default=list)  # list of internal symbols referenced
     content = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
-    embedding = Column(JSON, nullable=True) # Array matching all-MiniLM-L6-v2 vector output dims
+    
+    # 384 dimensions matching sentence-transformers/all-MiniLM-L6-v2
+    embedding = Column(JSON, nullable=True)
 
     file = relationship("File", back_populates="chunks")
 
@@ -51,8 +54,8 @@ class GraphEdge(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
-    source = Column(String, nullable=False)
-    target = Column(String, nullable=False)
-    type = Column(String, default="import")
+    source = Column(String, nullable=False)  # source file path
+    target = Column(String, nullable=False)  # target file path
+    type = Column(String, default="import")  # import, call, etc.
 
     repository = relationship("Repository", back_populates="edges")

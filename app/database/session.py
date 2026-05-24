@@ -5,11 +5,24 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+# Create the async engine
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_pre_ping=True,
+)
+
+# Async session maker
+SessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
 Base = declarative_base()
 
 async def get_db():
+    """Dependency for FastAPI endpoints to get a DB session."""
     async with SessionLocal() as session:
         try:
             yield session
@@ -21,12 +34,15 @@ async def get_db():
             await session.close()
 
 async def init_db():
+    """Initialize database tables and pgvector extension."""
     async with engine.begin() as conn:
+        # Enable pgvector extension
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             logger.info("Enabled pgvector extension")
         except Exception as e:
-            logger.warning(f"Could not initialize pgvector extension: {e}")
+            logger.warning(f"Could not enable pgvector extension (might already exist or permission error): {e}")
         
+        # Create all tables
         await conn.run_sync(Base.metadata.create_all)
-        logger.info("Database schemas synced successfully.")
+        logger.info("Database tables created successfully")

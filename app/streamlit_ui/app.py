@@ -1,314 +1,434 @@
-import logging
-import re
+import streamlit as st
+import requests
 import json
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Dict, Any, List
 
-from app.utils.logging import setup_logging
-from app.config.settings import settings
-from app.database.session import init_db, get_db, SessionLocal
-from app.models.db_models import Repository, GraphEdge
-from app.workflows.orchestrator import WorkflowOrchestrator, ChatState, IngestionState
-
-# Setup Logging
-setup_logging()
-logger = logging.getLogger(__name__)
-
-# FastAPI initialization
-app = FastAPI(
-    title="AI Repository Intelligence System",
-    description="Intelligent repository-aware RAG for public GitHub repos without cloning.",
-    version="1.0.0"
+# Configure page settings
+st.set_page_config(
+    page_title="Antigravity — Repository Intelligence Chatbot",
+    page_icon="✨",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Initialize workflow orchestrator singleton
-orchestrator = WorkflowOrchestrator()
+# Custom Premium Gemini-themed CSS
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Plus+Jakarta+Sans:wght@300;400;600;700&display=swap');
 
-@app.on_event("startup")
-async def startup_event():
-    """Run database initialization on application startup."""
-    logger.info("Starting up FastAPI application...")
-    await init_db()
-
-# Pydantic Schemas
-class IngestRequest(BaseModel):
-    url: str = Field(..., description="GitHub repository URL (e.g. https://github.com/owner/repo or https://github.com/owner/repo/tree/branch)")
-    branch: Optional[str] = Field(None, description="Optional branch override. If not specified, parsed from URL or fetched from GitHub default branch.")
-
-class ChatMessage(BaseModel):
-    role: str  # user or assistant
-    content: str
-
-class ChatRequest(BaseModel):
-    repo_id: int = Field(..., description="ID of the ingested repository in PostgreSQL")
-    query: str = Field(..., description="Developer question")
-    explanation_mode: str = Field("intermediate", description="Explanation detail level: beginner, intermediate, expert")
-    chat_history: List[ChatMessage] = Field(default_factory=list, description="Recent conversation history")
-
-# Utilities
-def parse_github_url(url: str) -> tuple[str, str, Optional[str]]:
-    """
-    Extracts owner, repo, and branch from a GitHub URL.
-    Handles:
-      https://github.com/owner/repo
-      https://github.com/owner/repo/tree/branch-name
-      https://github.com/owner/repo/tree/feature/some-branch
-    """
-    url_clean = url.strip().rstrip("/")
-    # Pattern to match: github.com/<owner>/<repo>
-    m = re.search(r"github\.com/([^/]+)/([^/]+)", url_clean)
-    if not m:
-        raise HTTPException(status_code=400, detail="Invalid GitHub URL format. Must point to a repository on github.com.")
+    /* Main App Background & Colors */
+    .stApp {
+        background-color: #080a10;
+        color: #e2e8f0;
+        font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+    }
     
-    owner = m.group(1)
-    repo = m.group(2)
-    if repo.endswith(".git"):
-        repo = repo[:-4]
+    /* Headers & Fonts */
+    h1, h2, h3, h4 {
+        font-family: 'Outfit', sans-serif !important;
+        color: #ffffff !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.02em;
+    }
     
-    # Check if a branch is specified in the URL path (e.g., /tree/<branch>)
-    branch = None
-    tree_marker = f"github.com/{owner}/{repo}/tree/"
-    if tree_marker in url_clean:
-        parts = url_clean.split(tree_marker)
-        if len(parts) > 1:
-            branch = parts[1]
-            
-    return owner, repo, branch
-
-# Endpoints
-@app.get("/health")
-async def health_check():
-    """Verify application health and availability."""
-    return {
-        "status": "healthy",
-        "settings": {
-            "embedding_model": settings.embedding_model,
-            "groq_model": settings.groq_model,
-            "concurrency_limit": settings.concurrency_limit
-        }
+    /* Glowing main Gemini title */
+    .gemini-title-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        margin-top: 1.5rem;
+        margin-bottom: 2.5rem;
+    }
+    
+    .gemini-title {
+        background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 25%, #a855f7 50%, #ec4899 75%, #f43f5e 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 3.5rem;
+        font-weight: 800;
+        text-align: center;
+        margin-bottom: 0.25rem;
+        letter-spacing: -0.03em;
+        filter: drop-shadow(0 2px 8px rgba(99, 102, 241, 0.25));
+    }
+    
+    .gemini-subtitle {
+        text-align: center;
+        color: #94a3b8;
+        font-size: 1.15rem;
+        font-weight: 300;
+        max-width: 600px;
+        line-height: 1.6;
     }
 
-@app.post("/ingest")
-async def ingest_repository(req: IngestRequest, db: AsyncSession = Depends(get_db)):
-    """
-    Asynchronously ingests a GitHub repository.
-    Fetches structures, parses AST, runs graph resolution, generates summaries,
-    generates embeddings, and stores in PostgreSQL.
-    """
-    owner, repo, url_branch = parse_github_url(req.url)
+    /* Glassmorphic Suggestion Cards */
+    .suggestion-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 1rem;
+        margin-bottom: 2rem;
+    }
     
-    # Determine branch to use:
-    # 1. Override in request
-    # 2. Parsed from tree URL
-    # 3. Fetch default branch from GitHub metadata
-    branch = req.branch or url_branch
-    if not branch:
-        # Fallback to fetching default branch from GitHub API
-        logger.info(f"Querying default branch metadata for {owner}/{repo}")
-        async with aiohttp_client_session() as session:
-            url = f"https://api.github.com/repos/{owner}/{repo}"
-            headers = {"Accept": "application/vnd.github.v3+json"}
-            if settings.github_pat:
-                headers["Authorization"] = f"Bearer {settings.github_pat}"
+    .suggestion-card {
+        background: rgba(30, 41, 59, 0.25);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 16px;
+        padding: 1.25rem;
+        cursor: pointer;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        backdrop-filter: blur(12px);
+    }
+    
+    .suggestion-card:hover {
+        background: rgba(99, 102, 241, 0.08);
+        border: 1px solid rgba(99, 102, 241, 0.25);
+        transform: translateY(-4px);
+        box-shadow: 0 10px 20px -10px rgba(99, 102, 241, 0.2);
+    }
+    
+    .suggestion-icon {
+        font-size: 1.5rem;
+        margin-bottom: 0.5rem;
+    }
+    
+    .suggestion-title {
+        font-weight: 600;
+        color: #ffffff;
+        font-size: 0.95rem;
+        margin-bottom: 0.25rem;
+    }
+    
+    .suggestion-desc {
+        color: #64748b;
+        font-size: 0.8rem;
+        line-height: 1.4;
+    }
+
+    /* Custom Chat Panels */
+    .chat-bubble {
+        padding: 1.25rem 1.5rem;
+        border-radius: 20px;
+        margin-bottom: 1.25rem;
+        line-height: 1.6;
+        font-size: 0.975rem;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+    
+    .chat-user {
+        background: rgba(99, 102, 241, 0.15);
+        color: #e0e7ff;
+        margin-left: 20%;
+        border-bottom-right-radius: 4px;
+        border: 1px solid rgba(99, 102, 241, 0.25);
+    }
+    
+    .chat-assistant {
+        background: rgba(30, 41, 59, 0.3);
+        color: #f1f5f9;
+        margin-right: 20%;
+        border-bottom-left-radius: 4px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        position: relative;
+    }
+    
+    .chat-assistant::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899);
+        border-top-left-radius: 4px;
+        border-top-right-radius: 20px;
+    }
+    
+    .chat-header {
+        font-family: 'Outfit', sans-serif;
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        margin-bottom: 0.5rem;
+        letter-spacing: 0.06em;
+    }
+    
+    .user-header {
+        color: #818cf8;
+    }
+    
+    .assistant-header {
+        background: linear-gradient(90deg, #a5b4fc, #f472b6);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    
+    /* Interactive Cards */
+    .glass-card {
+        background: rgba(15, 23, 42, 0.4);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 16px;
+        padding: 1.5rem;
+        margin-bottom: 1.25rem;
+        backdrop-filter: blur(16px);
+        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+API_BASE_URL = "http://localhost:8000"
+
+# Initialize Session States
+if "repo_id" not in st.session_state:
+    st.session_state.repo_id = None
+if "repo_name" not in st.session_state:
+    st.session_state.repo_name = ""
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "arch_summary" not in st.session_state:
+    st.session_state.arch_summary = {}
+if "selected_suggestion" not in st.session_state:
+    st.session_state.selected_suggestion = None
+
+# Sidebar settings
+with st.sidebar:
+    st.markdown("### 🌌 Ingest Repository")
+    st.markdown("Supply any GitHub Repository URL to start the deep code exploration.")
+    
+    github_url = st.text_input(
+        "GitHub Repository URL",
+        placeholder="https://github.com/owner/repo",
+        help="Paste a public github repository URL"
+    )
+    
+    branch_override = st.text_input(
+        "Branch (Optional)",
+        placeholder="e.g. main",
+        help="Defaults to primary branch if left empty."
+    )
+    
+    ingest_btn = st.button("🚀 Ingest & Index", use_container_width=True)
+    
+    st.divider()
+    
+    st.markdown("### 🧠 Explanation Level")
+    # Default is set to 'beginner' (index 0) for highly detailed code breakdowns and analogies!
+    explanation_mode = st.radio(
+        "Explain output as:",
+        options=["beginner", "intermediate", "expert"],
+        format_func=lambda x: x.capitalize(),
+        index=0,
+        help="Beginner: Analogies, concepts and clean algorithm tracing; Intermediate: Core directory & logic; Expert: Detailed syntax & bottlenecks."
+    )
+    
+    st.divider()
+    
+    if st.session_state.repo_id:
+        st.success(f"Active Codebase: **{st.session_state.repo_name}**")
+        if st.button("🧹 Reset Chat History", use_container_width=True):
+            st.session_state.chat_history = []
+            st.session_state.selected_suggestion = None
+            st.rerun()
+
+# Processing Ingestion Request
+if ingest_btn and github_url:
+    with st.spinner("Analyzing repository structures, computing syntax AST, building dependency graph..."):
+        try:
+            res = requests.post(
+                f"{API_BASE_URL}/ingest",
+                json={"url": github_url, "branch": branch_override or None},
+                timeout=120
+            )
+            if res.status_code == 200:
+                data = res.json()
+                st.session_state.repo_id = data["repository_id"]
+                st.session_state.repo_name = f"{data['owner']}/{data['repo']}"
+                st.session_state.arch_summary = data.get("architecture_summary", {})
+                st.session_state.chat_history = []  # Reset chat on new repo ingest
+                st.toast(f"Successfully indexed {st.session_state.repo_name}!", icon="✨")
+            else:
+                error_detail = res.json().get("detail", "Unknown backend error.")
+                st.error(f"Ingestion Failed: {error_detail}")
+        except Exception as e:
+            st.error(f"Failed to connect to backend server: {e}")
+
+# Header Title
+st.markdown("""
+<div class="gemini-title-container">
+    <div class="gemini-title">Antigravity</div>
+    <div class="gemini-subtitle">Interactive AI Software Architect specialized in explaining code, logical terms, database relations, and computational structures of git repositories.</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Main Application Layout
+if not st.session_state.repo_id:
+    # Landing Page State
+    st.markdown("<div class='glass-card' style='text-align: center;'>", unsafe_allow_html=True)
+    st.subheader("Initialize the Chatbot")
+    st.markdown("""
+    To begin, enter a public GitHub repository link in the left sidebar and click **Ingest & Index**.
+    
+    The AI system will parse the repository tree, build a NetworkX knowledge graph, parse class/function ASTs, and prepare a custom chatbot tailored to answer all your code queries natively.
+    """)
+    st.markdown("</div>", unsafe_allow_html=True)
+else:
+    # Tab navigation matching professional dashboard
+    tab1, tab2, tab3 = st.tabs(["✨ Codebase Chatbot", "📋 Architectural Dossier", "🌐 Module Import Graph"])
+    
+    # ----------------------------------------------------
+    # TAB 1: CODEBASE CHATBOT (Gemini Themed)
+    # ----------------------------------------------------
+    with tab1:
+        st.markdown(f"### Exploring Codebases: **{st.session_state.repo_name}**")
+        
+        # Display existing message history
+        for msg in st.session_state.chat_history:
+            role_class = "chat-user" if msg["role"] == "user" else "chat-assistant"
+            role_header = "Developer" if msg["role"] == "user" else "Antigravity Assistant"
+            header_class = "user-header" if msg["role"] == "user" else "assistant-header"
+            st.markdown(f"""
+            <div class="chat-bubble {role_class}">
+                <div class="chat-header {header_class}">{role_header}</div>
+                {msg['content']}
+            </div>
+            """, unsafe_allow_html=True)
+            
+        # Suggested prompt buttons for smooth workflow (Gemini suggestions)
+        st.markdown("<p style='font-size: 0.85rem; color: #64748b; font-weight: 600; margin-bottom: 0.5rem;'>SUGGESTED EXPLORATIONS</p>", unsafe_allow_html=True)
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+        
+        with col_s1:
+            if st.button("🔍 Explain Repository Purpose", use_container_width=True):
+                st.session_state.selected_suggestion = "Explain this repository and its main goals."
+        with col_s2:
+            if st.button("🚀 Trace Request flow & APIs", use_container_width=True):
+                st.session_state.selected_suggestion = "Explain how the APIs are structured and trace the execution path of a request."
+        with col_s3:
+            if st.button("💾 Trace Database Interactions", use_container_width=True):
+                st.session_state.selected_suggestion = "Explain the database schema, tables, models, and how queries are handled."
+        with col_s4:
+            if st.button("🧩 Explain Core Logics & Algorithms", use_container_width=True):
+                st.session_state.selected_suggestion = "Break down the core logic, functions, and key algorithms used inside this codebase."
+
+        # Input box
+        prompt = st.chat_input("Ask about the computational structures, specific code blocks, or import dependency flows...")
+        
+        # Override prompt if a suggestion was clicked
+        if st.session_state.selected_suggestion:
+            prompt = st.session_state.selected_suggestion
+            st.session_state.selected_suggestion = None  # Reset
+            
+        if prompt:
+            # Render user message
+            st.markdown(f"""
+            <div class="chat-bubble chat-user">
+                <div class="chat-header user-header">Developer</div>
+                {prompt}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Save user message to history
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            
+            # Call backend /chat with streaming
             try:
-                async with session.get(url, headers=headers, timeout=15) as response:
-                    if response.status == 200:
-                        meta = await response.json()
-                        branch = meta.get("default_branch", "main")
-                    else:
-                        branch = "main"
-            except Exception:
-                branch = "main"
+                payload = {
+                    "repo_id": st.session_state.repo_id,
+                    "query": prompt,
+                    "explanation_mode": explanation_mode,
+                    "chat_history": st.session_state.chat_history[:-1]
+                }
                 
-    logger.info(f"Triggering ingestion workflow for: {owner}/{repo} (branch: {branch})")
-    
-    # Run the LangGraph ingestion workflow
-    ingestion_flow = orchestrator.get_ingestion_flow()
-    initial_state = IngestionState(
-        owner=owner,
-        repo=repo,
-        branch=branch,
-        repo_id=None,
-        tree=[],
-        prioritized_files=[],
-        fetched_files=[],
-        chunks=[],
-        architecture_summary={},
-        progress="Starting ingestion pipeline."
-    )
-    
-    try:
-        final_state = await ingestion_flow.ainvoke(initial_state)
+                # Setup streaming placeholder
+                placeholder = st.empty()
+                stream_buffer = ""
+                
+                # Fetch stream response
+                with requests.post(f"{API_BASE_URL}/chat", json=payload, stream=True) as r:
+                    if r.status_code == 200:
+                        for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+                            if chunk:
+                                stream_buffer += chunk
+                                placeholder.markdown(f"""
+                                <div class="chat-bubble chat-assistant">
+                                    <div class="chat-header assistant-header">Antigravity Assistant ({explanation_mode.upper()} mode)</div>
+                                    {stream_buffer}
+                                </div>
+                                """, unsafe_allow_html=True)
+                        
+                        # Add complete assistant message to history
+                        st.session_state.chat_history.append({"role": "assistant", "content": stream_buffer})
+                        st.rerun()
+                    else:
+                        st.error(f"Chat failed with status code: {r.status_code}")
+            except Exception as e:
+                st.error(f"Failed to connect or fetch streaming chat: {e}")
+
+    # ----------------------------------------------------
+    # TAB 2: ARCHITECTURAL DOSSIER
+    # ----------------------------------------------------
+    with tab2:
+        st.subheader("📋 Core Project Architecture Dossier")
+        summary = st.session_state.arch_summary
         
-        # Fetch the newly created repository record from DB to verify
-        repo_id = final_state.get("repo_id")
-        if not repo_id:
-            raise HTTPException(status_code=500, detail="Ingestion failed. Repository ID was not generated.")
+        if not summary:
+            st.info("No architectural dossier generated for this repository.")
+        else:
+            col1, col2 = st.columns([1, 1])
             
-        return {
-            "success": True,
-            "repository_id": repo_id,
-            "owner": owner,
-            "repo": repo,
-            "branch": branch,
-            "architecture_summary": final_state.get("architecture_summary"),
-            "message": final_state.get("progress")
-        }
-    except Exception as e:
-        logger.exception("Error during repository ingestion workflow execution:")
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+            with col1:
+                st.markdown("#### 🌟 Project Purpose")
+                st.markdown(f"<div class='glass-card'>{summary.get('purpose', 'N/A')}</div>", unsafe_allow_html=True)
+                
+                st.markdown("#### 🛠️ Tech Stack & Dependencies")
+                st.markdown(f"<div class='glass-card'>{summary.get('tech_stack', 'N/A')}</div>", unsafe_allow_html=True)
+                
+                st.markdown("#### 🏗️ Architecture Design Patterns")
+                st.markdown(f"<div class='glass-card'>{summary.get('architecture_overview', 'N/A')}</div>", unsafe_allow_html=True)
 
-@app.post("/chat")
-async def chat_repository(req: ChatRequest):
-    """
-    Query the ingested repository with streaming responses.
-    Utilizes local embeddings for semantic retrieval, NetworkX graph for neighbor expansion,
-    and Groq client for streamed text response generation.
-    """
-    logger.info(f"Received chat request for repo_id: {req.repo_id}")
-    
-    # 1. Convert chat history schema
-    history_list = [{"role": msg.role, "content": msg.content} for msg in req.chat_history]
-    
-    # 2. Run retrieval node directly to get context
-    chat_flow = orchestrator.get_chat_flow()
-    
-    initial_state = ChatState(
-        repo_id=req.repo_id,
-        query=req.query,
-        explanation_mode=req.explanation_mode,
-        chat_history=history_list,
-        context={},
-        answer=""
-    )
-    
-    # Run the retrieval phase
-    try:
-        retrieval_state = await orchestrator.retrieve_node(initial_state)
-        context = retrieval_state.get("context", {})
-    except Exception as e:
-        logger.error(f"Failed context retrieval during chat: {e}")
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {str(e)}")
+            with col2:
+                st.markdown("#### ⚙️ Execution Flow & Initialization")
+                st.markdown(f"<div class='glass-card'>{summary.get('execution_flow', 'N/A')}</div>", unsafe_allow_html=True)
+                
+                st.markdown("#### 🔌 API Routes & Routing Patterns")
+                st.markdown(f"<div class='glass-card'>{summary.get('api_structure', 'N/A')}</div>", unsafe_allow_html=True)
+                
+                st.markdown("#### 💾 Database Models & Storage")
+                st.markdown(f"<div class='glass-card'>{summary.get('database_structure', 'N/A')}</div>", unsafe_allow_html=True)
 
-    # 3. Create generator to stream responses from Groq
-    async def stream_generator():
-        # Retrieve repository details
-        async with SessionLocal() as db:
-            stmt = select(Repository).where(Repository.id == req.repo_id)
-            res = await db.execute(stmt)
-            repo = res.scalars().first()
-            repo_title = f"{repo.owner}/{repo.name}" if repo else "this repository"
-            arch_summary_raw = repo.architecture_summary if repo else "{}"
-            try:
-                arch_summary = json.loads(arch_summary_raw, strict=False)
-            except Exception:
-                arch_summary = {}
-
-        personas = {
-            "beginner": "Explain using simple analogies and conceptual overviews. Avoid deep syntactical syntax unless asked. Focus on 'why' and 'what'.",
-            "intermediate": "Explain focusing on specific files, directory structures, and code architecture. Use typical developer terms (e.g. interfaces, REST API, state management).",
-            "expert": "Explain detailing code syntax, dependency resolution, execution timelines, performance bottlenecks, caching patterns, concurrency levels, and system design patterns."
-        }
-        persona = personas.get(req.explanation_mode, personas["intermediate"])
-
-        # Format retrieved context
-        chunks_str = ""
-        for item in context.get("chunks", []):
-            chunks_str += f"--- Code Symbol: {item['symbol_name']} in {item['file_path']} ---\n"
-            chunks_str += f"{item['content']}\n\n"
-            
-        neighbors_str = ""
-        for item in context.get("files_context", []):
-            neighbors_str += f"--- Neighbor File Context: {item['file_path']} ---\n"
-            neighbors_str += f"{item['content']}\n\n"
-
-        system_prompt = f"""
-You are an expert, world-class AI Software Architect named Antigravity.
-Your job is to explain the code, APIs, database, and architecture of {repo_title} based on the retrieved code chunks, file structure, and dependency graph neighbors.
-
-Your Target Audience Level: {req.explanation_mode.upper()}
-Explanation Guideline: {persona}
-
-Repository Summary:
-{json.dumps(arch_summary.get('purpose', ''))}
-Tech Stack:
-{json.dumps(arch_summary.get('tech_stack', ''))}
-
-=== RELEVANT CODE SYMBOLS ===
-{chunks_str}
-
-=== DEPENDENCY GRAPH NEIGHBORS ===
-{neighbors_str}
-
-Instruction:
-1. Ground your answer in the provided code snippets.
-2. If you don't know the answer, state that you cannot find the relevant code in the indexed parts of the repo. Do not hallucinate.
-3. Keep the code style clear, utilizing markdown headers and blockquotes where useful.
-"""
-        messages = [{"role": "system", "content": system_prompt}]
-        for chat in history_list[-6:]:
-            messages.append(chat)
-        messages.append({"role": "user", "content": req.query})
-
-        async for chunk in orchestrator.groq_client.get_chat_response_stream(messages):
-            yield chunk
-
-    return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
-@app.get("/repo/{repo_id}/summary")
-async def get_repository_summary(repo_id: int, db: AsyncSession = Depends(get_db)):
-    """Fetch the parsed architecture JSON report of the repository."""
-    stmt = select(Repository).where(Repository.id == repo_id)
-    res = await db.execute(stmt)
-    repo = res.scalars().first()
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repository not found.")
+    # ----------------------------------------------------
+    # TAB 3: MODULE IMPORT GRAPH
+    # ----------------------------------------------------
+    with tab3:
+        st.subheader("🌐 Interactive Module Dependency Mappings")
+        st.markdown("Visual diagram showcasing import connections between file modules across the codebase repository.")
         
-    try:
-        summary_data = json.loads(repo.architecture_summary, strict=False)
-    except Exception:
-        summary_data = {"error": "Failed to parse architecture summary."}
-        
-    return {
-        "repo_id": repo.id,
-        "owner": repo.owner,
-        "repo": repo.name,
-        "branch": repo.default_branch,
-        "summary": summary_data
-    }
-
-@app.get("/repo/{repo_id}/graph")
-async def get_repository_graph(repo_id: int, db: AsyncSession = Depends(get_db)):
-    """Fetch the serialized dependency edges list for visualization."""
-    stmt = select(GraphEdge).where(GraphEdge.repository_id == repo_id)
-    res = await db.execute(stmt)
-    edges = res.scalars().all()
-    
-    nodes_set = set()
-    edges_list = []
-    for edge in edges:
-        nodes_set.add(edge.source)
-        nodes_set.add(edge.target)
-        edges_list.append({
-            "source": edge.source,
-            "target": edge.target,
-            "type": edge.type
-        })
-        
-    return {
-        "nodes": [{"id": node, "label": node.split("/")[-1]} for node in nodes_set],
-        "edges": edges_list
-    }
-
-# Helper class for default branch query
-import aiohttp
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def aiohttp_client_session():
-    async with aiohttp.ClientSession() as session:
-        yield session
+        try:
+            res = requests.get(f"{API_BASE_URL}/repo/{st.session_state.repo_id}/graph")
+            if res.status_code == 200:
+                graph_data = res.json()
+                
+                if not graph_data.get("edges"):
+                    st.info("No module-level import edges detected. This may be a single-file project or uses dynamic imports.")
+                else:
+                    dot_parts = [
+                        "digraph G {",
+                        "  bgcolor=\"transparent\";",
+                        "  node [style=filled, fillcolor=\"#1e293b\", color=\"#475569\", fontcolor=\"#ffffff\", fontname=\"Helvetica\", shape=box, style=\"rounded,filled\"];",
+                        "  edge [color=\"#818cf8\", arrowhead=vee];"
+                    ]
+                    
+                    for node in graph_data["nodes"]:
+                        dot_parts.append(f'  "{node["id"]}" [label="{node["label"]}"];')
+                        
+                    for edge in graph_data["edges"]:
+                        dot_parts.append(f'  "{edge["source"]}" -> "{edge["target"]}";')
+                        
+                    dot_parts.append("}")
+                    dot_str = "\n".join(dot_parts)
+                    
+                    st.graphviz_chart(dot_str, use_container_width=True)
+            else:
+                st.error("Failed to retrieve codebase relationship graph.")
+        except Exception as e:
+            st.error(f"Error fetching/rendering graph: {e}")
